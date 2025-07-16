@@ -1,19 +1,18 @@
 package com.lx.rag.controller;
 
 import com.lx.rag.common.DataRequest;
+import com.lx.rag.mapper.SessionManager;
+import jakarta.servlet.http.HttpServletResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Flux;
-
-import java.io.IOException;
 import java.time.LocalDateTime;
 import java.util.Collections;
 import java.util.Map;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
 import static org.springframework.ai.chat.client.advisor.AbstractChatMemoryAdvisor.CHAT_MEMORY_CONVERSATION_ID_KEY;
 import static org.springframework.ai.chat.client.advisor.AbstractChatMemoryAdvisor.CHAT_MEMORY_RETRIEVE_SIZE_KEY;
@@ -24,123 +23,90 @@ import static org.springframework.ai.chat.client.advisor.AbstractChatMemoryAdvis
 public class ChatController {
 
     private final ChatClient chatClient;
+    private final SessionManager sessionManager;
 
-    // 存储会话数据的缓存（实际项目建议使用 Redis）
-    private final Map<String, DataRequest> sessionCache = new ConcurrentHashMap<>();
-
-    // 存储 SSE 连接的缓存
-    private final Map<String, SseEmitter> emitterCache = new ConcurrentHashMap<>();
-
-    public ChatController(ChatClient chatClient) {
+    public ChatController(ChatClient chatClient, SessionManager sessionManager) {
         this.chatClient = chatClient;
+        this.sessionManager = sessionManager;
     }
 
-    // 创建会话并返回会话 ID
+    /**
+     * 创建会话（返回唯一sessionId）
+     */
     @PostMapping("/create-session")
     public Map<String, String> createSession(@RequestBody DataRequest request) {
-        String sessionId = UUID.randomUUID().toString();
-        sessionCache.put(sessionId, request);
+        log.info("收到创建会话请求: {}", request);
+        validateRequest(request);
+
+        String sessionId = sessionManager.createSession(request);
+        log.info("创建新会话成功，sessionId={}", sessionId);
+
         return Collections.singletonMap("sessionId", sessionId);
     }
 
-    // SSE 端点：接收会话 ID，返回流式响应
-    @GetMapping("/query")
-    public SseEmitter query(@RequestParam("sessionId") String sessionId) {
-        // 从缓存获取请求数据
-        DataRequest request = sessionCache.get(sessionId);
-        if (request == null) {
-            throw new IllegalArgumentException("无效的会话 ID");
-        }
+    /**
+     * SSE流式响应接口
+     */
+    @GetMapping(value = "/query", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<String> query(@RequestParam("sessionId") String sessionId,
+                              HttpServletResponse response) {
+        log.info("收到查询请求，sessionId={}", sessionId);
 
-        // 创建 SSE 发射器，超时时间设为 30 分钟
-        SseEmitter emitter = new SseEmitter(30 * 60 * 1000L);
+        DataRequest request = sessionManager.getSession(sessionId)
+                .orElseThrow(() -> {
+                    log.warn("会话不存在，sessionId={}", sessionId);
+                    return new ResponseStatusException(HttpStatus.NOT_FOUND, "会话不存在");
+                });
 
-        // 存储发射器，用于后续推送
-        emitterCache.put(sessionId, emitter);
+        // 标记连接为活跃状态
+        sessionManager.markConnectionActive(sessionId);
 
-        // 设置完成、超时和错误处理
-        emitter.onCompletion(() -> emitterCache.remove(sessionId));
-        emitter.onTimeout(() -> emitterCache.remove(sessionId));
-        emitter.onError(e -> emitterCache.remove(sessionId));
-
-        try {
-            // 记录日志
-            log.info("用户输入:{}", request.getMessage());
-            log.info("会话id:{}", sessionId);
-
-            // 调用 AI 服务获取流式响应
-            Flux<ChatResponse> stream = chatClient.prompt()
-                    .user(request.getMessage())
-                    .system(spec -> spec.param("time", LocalDateTime.now()))
-                    .advisors(spec -> spec.param(CHAT_MEMORY_CONVERSATION_ID_KEY, sessionId)
-                            .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 30))
-                    .functions("searchTrainInfo")
-                    .stream()
-                    .chatResponse();
-
-            // 订阅流并发送数据到客户端
-            stream.subscribe(
-                    chatResponse -> {
-                        String content = chatResponse.getResult().getOutput().getContent();
-                        try {
-                            // 发送符合 SSE 规范的数据
-                            emitter.send(SseEmitter.event()
-                                    .id(UUID.randomUUID().toString())
-                                    .name("message")
-                                    .data(content));
-                        } catch (IOException e) {
-                            log.error("发送 SSE 数据失败", e);
-                            emitter.completeWithError(e);
-                        }
-                    },
-                    error -> {
-                        log.error("处理流数据失败", error);
-                        try {
-                            emitter.send(SseEmitter.event()
-                                    .id(UUID.randomUUID().toString())
-                                    .name("error")
-                                    .data("处理请求时发生错误"));
-                        } catch (IOException e) {
-                            log.error("发送错误信息失败", e);
-                        }
-                        emitter.completeWithError(error);
-                    },
-                    () -> {
-                        log.info("流数据处理完成");
-                        emitter.complete();
-                    }
-            );
-
-        } catch (Exception e) {
-            log.error("处理 SSE 请求失败", e);
-            emitter.completeWithError(e);
-        }
-
-        return emitter;
+        return chatClient.prompt()
+                .user(request.getMessage())
+                .system(spec -> spec.param("time", LocalDateTime.now()))
+                .advisors(spec -> spec.param(CHAT_MEMORY_CONVERSATION_ID_KEY, sessionId)
+                        .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 30))
+                .functions("searchTrainInfo")
+                .stream()
+                .chatResponse()
+                .map(chatResponse -> formatSseMessage(chatResponse.getResult().getOutput().getContent()))
+                .doOnCancel(() -> sessionManager.markConnectionInactive(sessionId))
+                .doOnTerminate(() -> sessionManager.markConnectionInactive(sessionId));
     }
 
-    // 新增：更新会话内容的接口
+    /**
+     * 更新会话内容
+     */
     @PostMapping("/update-session")
-    public void updateSession(@RequestParam("s") String sessionId,
+    public void updateSession(@RequestParam("sessionId") String sessionId,
                               @RequestBody DataRequest request) {
-        DataRequest existingRequest = sessionCache.get(sessionId);
-        if (existingRequest != null) {
-            // 合并新消息到现有会话（具体逻辑根据需求调整）
-            existingRequest.setMessage(request.getMessage());
-            // 可能需要维护对话历史数组
-        } else {
-            throw new IllegalArgumentException("无效的会话 ID");
-        }
+        log.info("收到更新会话请求，sessionId={}", sessionId);
+        validateRequest(request);
+
+        sessionManager.updateSession(sessionId, request);
+        log.info("会话内容更新成功，sessionId={}", sessionId);
     }
 
-    // 关闭会话的接口
+    /**
+     * 关闭会话
+     */
     @PostMapping("/close-session")
-    public void closeSession(@RequestParam("s") String sessionId) {
-        SseEmitter emitter = emitterCache.get(sessionId);
-        if (emitter != null) {
-            emitter.complete();
-            emitterCache.remove(sessionId);
+    public void closeSession(@RequestParam("sessionId") String sessionId) {
+        log.info("收到关闭会话请求，sessionId={}", sessionId);
+
+        sessionManager.closeSession(sessionId);
+        log.info("会话关闭成功，sessionId={}", sessionId);
+    }
+
+    // 辅助方法：格式化SSE消息
+    private String formatSseMessage(String content) {
+        return "data: " + content.replace("\n", "\ndata: ") + "\n\n";
+    }
+
+    // 验证请求是否有效
+    private void validateRequest(DataRequest request) {
+        if (request == null || request.getMessage() == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "请求参数不能为空");
         }
-        sessionCache.remove(sessionId);
     }
 }
